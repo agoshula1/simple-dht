@@ -4,21 +4,17 @@
 package main
 
 import (
-    //"github.com/jabong/florest-core/src/common/collections/maps/concurrentmap/concurrenthashmap"
     "github.com/fanliao/go-concurrentMap"
     "fmt"
-    //"io"
     "hash/fnv"
     "sort"
-    //"encoding/binary"
     "sync"
     "math/rand"
     "strconv"
-    //"time"
 )
 
 type Node struct {
-  alive bool
+  alive bool // true if node is functional (false if it has crashed)
   aliveMux *sync.RWMutex
   localMap *concurrent.ConcurrentMap
 }
@@ -32,18 +28,21 @@ func NewNode() *Node {
 	return n
 }
 
+// called when node has crashed or recovered
 func (n *Node) updateLiveness(isAlive bool) {
   n.aliveMux.Lock()
   defer n.aliveMux.Unlock()
   n.alive = isAlive
 }
 
+// returns true if node is functional
 func (n *Node) isAlive() bool {
   n.aliveMux.RLock()
   defer n.aliveMux.RUnlock()
   return n.alive
 }
 
+// hash function to find position of virtual nodes and keys on ring
 func hash(s string) int {
   h := fnv.New32a()
   h.Write([]byte(s))
@@ -53,7 +52,7 @@ func hash(s string) int {
 type RingHash struct {
   vNodes []int //virtual nodes
   vNodesMux *sync.RWMutex
-  numVirtuals int
+  numVirtuals int //number of virtual nodes per real node
   nodes *concurrent.ConcurrentMap //actual nodes
   hashMap *concurrent.ConcurrentMap //mapping from virtual node to corresponding real node
   db *concurrent.ConcurrentMap //representing data base server
@@ -72,10 +71,9 @@ func NewRing(virtuals int) *RingHash {
 
 // Returns true if there are no available nodes
 func (r *RingHash) IsEmpty() bool {
-	//for _, node := range r.nodes{
-  for itr := r.nodes.Iterator();itr.HasNext(); {
+	for itr := r.nodes.Iterator();itr.HasNext(); {
   	_, node, _ := itr.Next()
-    // inactive nodes may be represented in system
+    // inactive nodes may still be recorded in system
     if node.(*Node).isAlive(){
       return false
     }
@@ -123,8 +121,7 @@ func (r *RingHash) Remove(node string) {
   }
 }
 
-// Gets the closest node in the ring to the provided key
-// May point to deactivated node
+// Gets the closest active node in the ring to the provided key
 func (r *RingHash) get(key string) string {
 	if r.IsEmpty() {
 		return ""
@@ -148,6 +145,7 @@ func (r *RingHash) get(key string) string {
   // find next active node
   for ; !node.(*Node).isAlive(); {
     idx++ // virtual nodes are in sorted ascending order
+
     // Means we have cycled back to the first virtual node.
     if idx == len(r.vNodes) {
       idx = 0
@@ -197,16 +195,18 @@ func (r *RingHash) Put(key string, value int) {
   }
 }
 
-// test effects of removing (deactivating) and adding back (reactivating) same node
+// test effects of deactivating and reactivating same node
 func basictest() {
-  //initialize ring and nodes
-  ring := NewRing(2)
+  // initialize ring and nodes
+  ring := NewRing(2) //two virtual nodes per real node
 
+  // three real nodes
   for i := 0; i < 3; i++ {
     id := "node" + strconv.Itoa(i)
     ring.Add(id)
   }
 
+  // ten keys
   var wait sync.WaitGroup
   wait.Add(10)
   for i := 0; i < 10; i++ {
@@ -217,8 +217,10 @@ func basictest() {
   }
 
   nodeId := "node0"
-  // deactivate
+  // deactivate node0
   ring.Remove(nodeId)
+
+  // key0 should be mapped to a different node
   if ring.get("key0") == nodeId{
     fmt.Println("Error: node not properly deactivated\n")
   }
@@ -226,16 +228,19 @@ func basictest() {
     fmt.Println("Error: did not get expected value after deactivation\n")
   }
 
-  // reactivate
+  // reactivate node0
   ring.vNodesMux.RLock()
   virtualsCount := len(ring.vNodes)
   ring.vNodesMux.RUnlock()
   ring.Add(nodeId)
 
+  // virtual nodes for node0 should already be in system
   ring.vNodesMux.RLock()
   if virtualsCount != len(ring.vNodes){
     fmt.Println("Error: adding extra virtual nodes after reactivation\n")
   }
+
+  // key0 should be remapped to node0
   ring.vNodesMux.RUnlock()
   if ring.get("key0") != nodeId{
     fmt.Println("Error: node not properly reactivated\n")
@@ -245,10 +250,12 @@ func basictest() {
   }
 }
 
+// test that only necessary keys are remapped after a node crashes
 func balancetest() {
-  //initialize ring and nodes
-  ring := NewRing(1)
+  // initialize ring and nodes
+  ring := NewRing(1) //one virtual node per real node
 
+  // four real nodes
   var nodes []string
   for i := 0; i < 4; i++ {
     id := "node" + strconv.Itoa(i)
@@ -256,6 +263,7 @@ func balancetest() {
     ring.Add(id)
   }
 
+  // four keys
   var wait sync.WaitGroup
   wait.Add(4)
   for i := 0; i < 4; i++ {
@@ -265,6 +273,7 @@ func balancetest() {
     }(i)
   }
 
+  // count number of keys for each node
   loads := make(map[string]int)
   for _, node := range nodes{
     loads[node] = countLoad(ring, node)
@@ -274,17 +283,20 @@ func balancetest() {
   ring.Remove("node1")
   changed := 0
 
+  // check how many nodes had key mappings changed after node1 crashed
   for _, node := range nodes{
     if node != "node1" && loads[node] != countLoad(ring, node) {
       changed++
     }
   }
 
+  // only one key should have moved
   if changed > 1{
     fmt.Println("Error: more keys moved than needed")
   }
 }
 
+// helper function to count number of keys mapped to a node
 func countLoad(ring *RingHash, nodeId string) int{
   node, _ := ring.nodes.Get(nodeId)
   count := 0
@@ -295,23 +307,23 @@ func countLoad(ring *RingHash, nodeId string) int{
   return count
 }
 
+// simulation of dht with occasional node crashes and recoveries
 func demo() {
-  //initialize ring and nodes
-  ring := NewRing(10)
+  // initialize ring and nodes
+  ring := NewRing(10) // ten virtual nodes per real node
 
-  //var nodes map[string]*Node
+  // 25 real nodes
   var nodes []string
   var nodesMux = &sync.Mutex{}
   for i := 0; i < 25; i++ {
     id := "node" + strconv.Itoa(i)
-    //nodes[id] = &Node{alive: true, localMap: concurrenthashmap.New()}
     nodes = append(nodes, id)
     ring.Add(id)
   }
 
+  // 50 keys
   var wait sync.WaitGroup
   wait.Add(50)
-
   for i := 0; i < 50; i++ {
     go func(ind int){
       ring.Put("key" + strconv.Itoa(ind), ind)
@@ -324,31 +336,34 @@ func demo() {
   r := rand.New(rand.NewSource(99))
   for i := 0; i < 50; i++{
     if i % 3 == 0{
-      //remove or add node
-      go func(coin int){
+      // remove or add node
+      go func(coinflip int){
         nodesMux.Lock()
         defer nodesMux.Unlock()
-        //fmt.Printf("nodes: %v", nodes)
-        if coin % 2 == 0{
-          //remove
+
+        if coinflip % 2 == 0{
+          // node (chosen at random) crashes
+          // Note: chosen node may have already crashed
           if len(nodes) > 0 {
             ind := 0
             if len(nodes) > 1 {
             ind = r.Intn(len(nodes) - 1)
             }
-            fmt.Printf("removing node%d\n", ind)
+            //fmt.Printf("removing node%d\n", ind)
             ring.Remove("node" + strconv.Itoa(ind))
-            nodes = append(nodes[:ind], nodes[ind + 1:]...)
           }
         } else {
+          // node (chosen at random) recovers or is added to system
+          // Note: chosen node may already be functional
           ind := 0
           if len(nodes) > 0 {
             ind = r.Intn(len(nodes))
           }
-          fmt.Printf("adding node%d\n", ind)
+          //fmt.Printf("adding node%d\n", ind)
           nodeId := "node" + strconv.Itoa(ind)
           ring.Add(nodeId)
           if ind == len(nodes){
+            // new node was added to system, add to list
             nodes = append(nodes,nodeId)
           }
         }
@@ -356,7 +371,7 @@ func demo() {
       }(i)
 
     } else {
-      //get (key)
+      // get value from key
       go func(k string) {
         v, found := ring.Get(k)
         if !found{
@@ -373,7 +388,10 @@ func demo() {
 }
 
 func main() {
+  fmt.Println("Running basic test")
   basictest()
+  fmt.Println("\nRunning balance test")
   balancetest()
-  //demo()
+  fmt.Println("\nRunning demo")
+  demo()
 }
